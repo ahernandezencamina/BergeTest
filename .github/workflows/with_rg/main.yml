@@ -152,8 +152,7 @@ jobs:
           echo "NOW=$(date -u +'%Y%m%d-%H%Mz')" >> $GITHUB_ENV
           echo "AZ_ACR_HOST=$az_acr_host" >> $GITHUB_ENV
           echo "AZ_RG_NAME=$az_rg_name" >> $GITHUB_ENV          
-          echo "AZ_ACA_AI_AGENT_PROCCESSOR_NAME=$az_aca_ai_agent_proccessor_name" >> $GITHUB_ENV
-          echo "AZ_ACA_AI_AGENT_SEND_SAP_NAME=$az_aca_ai_agent_send_sap_name" >> $GITHUB_ENV
+          echo "AZ_ACA_AI_AGENT_PROCCESSOR_NAME=$az_aca_ai_agent_proccessor_name" >> $GITHUB_ENV          
           echo "Azure Resource Group name is: $az_rg_name"
           echo "Azure Container Registry host is: $az_acr_host"          
           echo "Azure Container App name for AI Agent Proccessor is: $az_aca_ai_agent_proccessor_name"          
@@ -198,16 +197,6 @@ jobs:
       # for further processing. We then use the `grep` command to extract the name of the created image from the temporary file's content. The extracted
       # image name is stored in the IMAGE_NAME variable, making it available for subsequent steps. Finally, we remove the temporary file to clean up.
 
-      - name: Build & Publish Image - AI Agent Email
-        id: BuildPublishImageAgentEmail
-        run: |
-          TEMP_FILE=$(mktemp)
-          dotnet publish ./src/Seed.Core.IA.SendMail -c ${{ env.BUILD_CONFIGURATION }} -p:ContainerImageTags='"${{ steps.GetVersion.outputs.RELEASE_VERSION }};latest"' -p:ContainerRegistry=${{ env.AZ_ACR_HOST }} /t:PublishContainer | tee $TEMP_FILE
-          IMAGE_NAME=$(grep -oP "(?<=Pushed image ')[^:']*" $TEMP_FILE)
-          echo "IMAGE_NAME=$IMAGE_NAME" >> $GITHUB_OUTPUT
-          echo "Image name for Bot Backend is $IMAGE_NAME"
-          rm $TEMP_FILE
-
       - name: Build & Publish Image - AI Agent Proccessor
         id: BuildPublishImageAgentProccessor
         run: |
@@ -218,25 +207,8 @@ jobs:
           echo "Image name for Bot Backend is $IMAGE_NAME"
           rm $TEMP_FILE
 
-      - name: Build & Publish Image - AI Agent Send Sap
-        id: BuildPublishImageAgentSendSap
-        run: |
-          TEMP_FILE=$(mktemp)
-          dotnet publish ./src/Seed.Core.IA.SendToSAP -c ${{ env.BUILD_CONFIGURATION }} -p:ContainerImageTags='"${{ steps.GetVersion.outputs.RELEASE_VERSION }};latest"' -p:ContainerRegistry=${{ env.AZ_ACR_HOST }} /t:PublishContainer | tee $TEMP_FILE
-          IMAGE_NAME=$(grep -oP "(?<=Pushed image ')[^:']*" $TEMP_FILE)
-          echo "IMAGE_NAME=$IMAGE_NAME" >> $GITHUB_OUTPUT
-          echo "Image name for Bot Backend is $IMAGE_NAME"
-          rm $TEMP_FILE
-
       # In the nexts `Update Container App` steps We use the `az containerapp revision copy` command to create a new revision copying the last revision in the Azure Container App.
-
-      - name: Update Container App - AI Agent Email
-        uses: azure/cli@v2
-        with:
-          azcliversion: ${{ vars.AZ_CLI_VERSION }}
-          inlineScript: |
-            az containerapp revision copy -n ${{ env.AZ_ACA_AI_AGENT_EMAIL_NAME }} -g ${{ env.AZ_RG_NAME }} -i ${{ env.AZ_ACR_HOST }}/${{ steps.BuildPublishImageAgentEmail.outputs.IMAGE_NAME }}:${{ steps.GetVersion.outputs.RELEASE_VERSION }} --revision-suffix build-${{ github.run_number }}-${{ env.NOW }}
-
+          
       - name: Update Container App - AI Agent Proccessor
         uses: azure/cli@v2
         with:
@@ -244,14 +216,7 @@ jobs:
           inlineScript: |
             az containerapp revision copy -n ${{ env.AZ_ACA_AI_AGENT_PROCCESSOR_NAME }} -g ${{ env.AZ_RG_NAME }} -i ${{ env.AZ_ACR_HOST }}/${{ steps.BuildPublishImageAgentProccessor.outputs.IMAGE_NAME }}:${{ steps.GetVersion.outputs.RELEASE_VERSION }} --revision-suffix build-${{ github.run_number }}-${{ env.NOW }}
 
-      - name: Update Container App - AI Agent Send Sap
-        uses: azure/cli@v2
-        with:
-          azcliversion: ${{ vars.AZ_CLI_VERSION }}
-          inlineScript: |
-            az containerapp revision copy -n ${{ env.AZ_ACA_AI_AGENT_SEND_SAP_NAME }} -g ${{ env.AZ_RG_NAME }} -i ${{ env.AZ_ACR_HOST }}/${{ steps.BuildPublishImageAgentSendSap.outputs.IMAGE_NAME }}:${{ steps.GetVersion.outputs.RELEASE_VERSION }} --revision-suffix build-${{ github.run_number }}-${{ env.NOW }}
-
-      # Finnaly, We create a new release on the repository using the `gh release create` command.
+     # Finnaly, We create a new release on the repository using the `gh release create` command.
       # This command creates a new release with the specified tag and title, and generates release notes based on the commits since the last release.
 
       - name: Create Release & Tag
