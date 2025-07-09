@@ -1,0 +1,97 @@
+name: IaC-000-Backend
+
+trigger: none
+pr: none
+
+# Pipeline to provision only the remote Terraform backend
+# Does not run 'terraform apply' against infrastructure resources, only creates the backend state.
+
+parameters:
+  - name: environment
+    type: string
+    default: Development
+    values:
+      - Development
+      - Production
+
+variables:
+  - name: environment
+    value: ${{ parameters.environment }}
+  - group: Berge
+
+stages:
+  - stage: BootstrapBackend
+    displayName: 'Remote Bootstrap Backend'
+    jobs:
+      - job: CreateBackendResources
+        displayName: 'Create RG, Storage Account and Container'
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: 'Azure CLI Login'
+            inputs:
+              azureSubscription: '$(AZURE_SERVICE_CONNECTION_NAME)'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                az account show
+
+          - task: AzureCLI@2
+            displayName: 'Create/Commit RG, Storage, Container'
+            inputs:
+              azureSubscription: '$(AZURE_SERVICE_CONNECTION_NAME)'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                az group create \
+                  --name $(TF_BACKEND_RESOURCE_GROUP_NAME) \
+                  --location $(TF_BACKEND_LOCATION)
+
+                az storage account show \
+                  --name $(TF_BACKEND_STORAGE_ACCOUNT_NAME) \
+                  --resource-group $(TF_BACKEND_RESOURCE_GROUP_NAME) \
+                || az storage account create \
+                  --name $(TF_BACKEND_STORAGE_ACCOUNT_NAME) \
+                  --resource-group $(TF_BACKEND_RESOURCE_GROUP_NAME) \
+                  --sku Standard_RAGRS \
+                  --kind StorageV2 \
+                  --access-tier Hot
+
+                az storage container create \
+                  --name $(TF_BACKEND_CONTAINER_NAME) \
+                  --account-name $(TF_BACKEND_STORAGE_ACCOUNT_NAME)
+
+  - stage: ConfigureTerraform
+    displayName: 'Configure Terraform Backend'
+    dependsOn: BootstrapBackend
+    jobs:
+      - job: TerraformInitOnly
+        displayName: 'Init remoting only'
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: self
+
+          - task: TerraformInstaller@1
+            displayName: 'Setup Terraform $(TF_VERSION)'
+            inputs:
+              terraformVersion: '$(TF_VERSION)'
+
+          - task: TerraformCLI@1
+            displayName: 'Terraform Init (Only Backend)'
+            inputs:
+              command: 'init'
+              workingDirectory: '$(TF_WORKING_DIR_BACKEND)'
+              backendType: 'azurerm'
+              backendServiceArm: '$(AZURE_SERVICE_CONNECTION_NAME)'
+              ensureBackend: true
+              commandOptions: >
+                -upgrade
+                -reconfigure
+              backendAzureRmResourceGroupName: '$(TF_BACKEND_RESOURCE_GROUP_NAME)'
+              backendAzureRmStorageAccountName: '$(TF_BACKEND_STORAGE_ACCOUNT_NAME)'
+              backendAzureRmContainerName: '$(TF_BACKEND_CONTAINER_NAME)'
+              backendAzureRmKey: 'backend-$(environment).tfstate'

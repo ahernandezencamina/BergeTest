@@ -1,0 +1,116 @@
+name: IaC-003-Destroy
+
+trigger: none
+pr: none
+
+parameters:
+  - name: environment
+    type: string
+    default: Development
+    values:
+      - Development
+      - Production
+  - name: customSuffix
+    type: string
+    default: 'default'
+    displayName: 'Custom resource suffix (leave as default to use environment-based suffix)'
+
+variables:
+  - name: environment
+    value: ${{ parameters.environment }}
+  
+  - name: environmentSuffix
+    ${{ if ne(parameters.customSuffix, 'default') }}:
+      value: ${{ parameters.customSuffix }}
+    ${{ else }}:
+      ${{ if eq(parameters.environment, 'Production') }}:
+        value: 'pro'
+      ${{ else }}:
+        value: 'dev'
+  
+  - group: Berge
+
+stages:
+  - stage: ResourcesDestroy
+    displayName: 'Destroy Resources'
+    jobs:
+      - job: TerraformDestroy
+        displayName: 'Terraform Destroy'
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - task: AzureCLI@2
+            displayName: 'Azure Login'
+            inputs:
+              azureSubscription: '$(AZURE_SERVICE_CONNECTION_NAME)'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                az account show
+
+          - checkout: self
+
+          - task: TerraformInstaller@1
+            displayName: 'Setup Terraform $(TF_VERSION)'
+            inputs:
+              terraformVersion: '$(TF_VERSION)'
+
+          - task: TerraformCLI@1
+            displayName: 'Terraform Init'
+            inputs:
+              command: 'init'
+              workingDirectory: '$(TF_WORKING_DIR_RESOURCES)'
+              backendType: 'azurerm'
+              backendServiceArm: '$(AZURE_SERVICE_CONNECTION_NAME)'
+              ensureBackend: false
+              commandOptions: >
+                -upgrade
+                -reconfigure
+              backendAzureRmResourceGroupName: '$(TF_BACKEND_RESOURCE_GROUP_NAME)'
+              backendAzureRmStorageAccountName: '$(TF_BACKEND_STORAGE_ACCOUNT_NAME)'
+              backendAzureRmContainerName: '$(TF_BACKEND_CONTAINER_NAME)'
+              backendAzureRmKey: '$(environmentSuffix).terraform.tfstate'
+
+          - task: Bash@3
+            displayName: 'Create Terraform Variables File'
+            inputs:
+              targetType: 'inline'
+              workingDirectory: '$(TF_WORKING_DIR_RESOURCES)'
+              script: |
+                cat > terraform.tfvars <<EOF
+                subscription_id = "$(AZURE_SUBSCRIPTION_ID)"
+                use_random_suffix = false
+                suffix = "$(environmentSuffix)"
+                environment = "$(environment)"
+                resource_group_name = "$(AZ_RG_NAME)"
+                acr_name = "$(AZ_ACR_NAME)"
+                afunc_service_plan_name = "$(AZ_FUNC_SERVICE_PLAN_NAME)"
+                app_insights_name = "$(AZ_APP_INSIGHTS_NAME)"
+                ace_name = "$(AZ_ACE_NAME)"
+                appcs_name = "$(AZ_APPCS_NAME)"
+                cosmos_name = "$(AZ_COSMOS_NAME)"
+                kv_name = "$(AZ_KV_NAME)"
+                log_analytics_workspace_name = "$(AZ_LOG_ANALYTICS_WORKSPACE_NAME)"
+                managed_identity_name = "$(AZ_MANAGE_IDENTITY_NAME)"
+                openai_name = "$(AZ_OPENAI_NAME)"
+                storage_account_name = "$(AZ_STORAGE_ACCOUNT_NAME)"
+                service_bus_name = "$(AZ_SERVICE_BUS_NAME)"
+                aca_ai_agent_response_name = "$(AZ_ACA_AI_AGENT_RESPONSE_NAME)"
+                aca_ai_agent_proccessor_name = "$(AZ_ACA_AI_AGENT_PROCCESSOR_NAME)"
+                afunc_service_bus_email_name = "$(AZ_FUNC_SERVICE_BUS_EMAIL_NAME)"
+                afunc_service_bus_email_response_name = "$(AZ_FUNC_SERVICE_BUS_EMAIL_RESPONSE_NAME)"
+                cosmos_location = "$(AZ_COSMOS_LOCATION)"
+                openai_location = "$(AZ_OPENAI_LOCATION)"
+                conf__blob_container_name = "$(AZ_BLOB_CONTAINER_NAME)"
+                EOF
+                
+                echo "Created terraform.tfvars with the following content:"
+                cat terraform.tfvars
+
+          - task: TerraformCLI@1
+            displayName: 'Terraform Destroy'
+            inputs:
+              command: 'destroy'
+              workingDirectory: '$(TF_WORKING_DIR_RESOURCES)'
+              environmentServiceName: '$(AZURE_SERVICE_CONNECTION_NAME)'
+              commandOptions: '-auto-approve -var-file=terraform.tfvars'

@@ -1,0 +1,339 @@
+name: "CI/CD"
+
+on:
+  push:
+    branches:
+      - develop
+    paths:
+      - "src/**"
+      - "Directory.Build.props"
+      - "Directory.Build.targets"
+      - "Seed.AI.sln"
+      - "!.github/**"
+      - "!/**/*.md"
+      - "!docs/**"
+      - "!infra/**"
+      - "!postman/**"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "src/**"
+      - "Directory.Build.props"
+      - "Directory.Build.targets"
+      - "Seed.AI.sln"
+      - "!.github/**"
+      - "!/**/*.md"
+      - "!docs/**"
+      - "!infra/**"
+      - "!postman/**"
+  workflow_dispatch:
+    inputs:
+      suffix:
+        description: "Suffix to identify manual deployment (madatory when not redeploying a branch):"
+        required: false
+        type: string
+
+# Set the `contents` to `write` to allow the workflow to create a new release on the repository.
+# Set the `id-token` to `write` to allow the workflow to fetch an OpenID Connect (OIDC) token. More info: https://docs.github.com/en/actions/deployment/security-hardening-your-deployments/about-security-hardening-with-openid-connect#updating-your-actions-for-oidc
+# Reference: https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/controlling-permissions-for-github_token
+permissions:
+  contents: write
+  id-token: write
+
+env:
+  # These environment variables are used by the Terraform Azure provider to setup OIDD authenticate.
+  ARM_CLIENT_ID: "${{ secrets.AZURE_CLIENT_ID }}"
+  ARM_SUBSCRIPTION_ID: "${{ secrets.AZURE_SUBSCRIPTION_ID }}"
+  ARM_TENANT_ID: "${{ secrets.AZURE_TENANT_ID }}"
+  ARM_CLIENT_SECRET: "${{ secrets.AZURE_CLIENT_SECRET }}"
+
+  BUILD_CONFIGURATION: ${{ startsWith(github.ref, 'refs/heads/main') && 'Release' || 'Debug' }}
+
+  DEPLOYMENT_SUFFIX: ${{ github.event_name == 'workflow_dispatch' && inputs.suffix || (github.ref == 'refs/heads/main' && 'pro') || (github.ref == 'refs/heads/test' && 'tst') || (github.ref == 'refs/heads/develop' && 'dev') || 'dev' }}
+
+jobs:
+  validate-inputs:
+    name: "Validate Inputs"
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check if suffix is required
+        if: ${{ !(github.ref == 'refs/heads/main' || github.ref == 'refs/heads/test' || github.ref == 'refs/heads/develop') && !github.event.inputs.suffix }}
+        run: |
+          echo "Error: The input of a suffix to identify a manual deployment is required when the branch is not 'main', 'test', or 'develop'."
+          exit 1
+
+  continuous-integration:
+    name: "Continuous Integration"
+    runs-on: ubuntu-latest
+    needs: validate-inputs
+    timeout-minutes: 30
+    if: ${{ github.event_name != 'workflow_dispatch' || (github.event_name == 'workflow_dispatch' && success()) }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+        # To properly use SonarCloud analyzer, the workflow must have JAVA installed
+      - name: Set Java for SonarCloud
+        uses: actions/setup-java@v4
+        with:
+          distribution: "microsoft"
+          java-version: "21"
+
+      - name: Using .NET from 'global.json'
+        uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      - name: Install .NET Aspire Workload
+        run: |
+          dotnet workload install aspire
+          echo "Update .NET workloads versions from rollback.json file..."
+          dotnet workload update --from-rollback-file ./rollback.json
+
+      - name: Restore NuGet Packages
+        # Restore NuGet packages only for all `.csproj` projects.
+        # This is required because in Ubuntu the `dotnet restore` fails when `.esproj` projects are part of the solution.
+        run: |
+          for proj in $(find src -name '*.csproj'); do
+            dotnet restore "$proj" --configfile NuGet.config --verbosity Minimal --ignore-failed-sources
+          done
+
+      - name: Install Report Generator Tool
+        run: dotnet tool install dotnet-reportgenerator-globaltool --tool-path tools --ignore-failed-sources
+
+      - name: Execute Unit Tests
+        run: dotnet test --nologo --no-restore --collect:"XPlat Code Coverage" --configuration  ${{ env.BUILD_CONFIGURATION }} --settings coverlet.runsettings
+
+      - name: Generate Coverage Report
+        run: ./tools/reportgenerator -reports:./**/coverage.cobertura.xml -targetdir:coverage/Cobertura -reporttypes:'MarkdownSummaryGithub;Cobertura'
+        continue-on-error: true
+
+      - name: Publish Coverage Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: code-coverage-report
+          path: coverage/Cobertura/
+
+      - name: Write Coverage Report to Job Summary
+        run: cat coverage/Cobertura/SummaryGithub.md >> $GITHUB_STEP_SUMMARY
+        continue-on-error: true
+
+      - name: Build Solution
+        run: dotnet build --nologo --no-restore --configuration ${{ env.BUILD_CONFIGURATION }}
+
+
+  continous-deployment:
+    name: "Continuous Deployment"
+    runs-on: ubuntu-latest
+    needs: continuous-integration
+    if: ${{ github.event_name != 'pull_request' || (github.event_name == 'workflow_dispatch' && success()) }}
+    timeout-minutes: 30
+    steps:
+      - name: Set Additional Environment Variables
+        # The following environment variables are set here due to a limitation on GitHub Actions that does not allow creating environment variables from other environment variables.
+        run: |
+          az_rg_name="${{ vars.AZ_RG_NAME }}" 
+          az_acr_host="${{ vars.AZ_ACR_NAME }}${{ env.DEPLOYMENT_SUFFIX }}.azurecr.io"
+          az_aca_bot_name="${{ vars.AZ_ACA_BOT_NAME }}-${{ env.DEPLOYMENT_SUFFIX }}"
+          az_aca_ai_assistant_name="${{ vars.AZ_ACA_AI_ASSISTANT_NAME }}-${{ env.DEPLOYMENT_SUFFIX }}"
+          az_aca_ai_agent_chitchat_name="${{ vars.AZ_ACA_AI_AGENT_CHITCHAT_NAME }}-${{ env.DEPLOYMENT_SUFFIX }}"
+          az_aca_ai_agent_companydocs_name="${{ vars.AZ_ACA_AI_AGENT_COMPANYDOCS_NAME }}-${{ env.DEPLOYMENT_SUFFIX }}"
+          az_aca_ai_agent_ask_name="${{ vars.AZ_ACA_AI_AGENT_ASK_NAME }}-${{ env.DEPLOYMENT_SUFFIX }}"
+          az_aca_ai_agent_summarize_name="${{ vars.AZ_ACA_AI_AGENT_SUMMARIZE_NAME }}-${{ env.DEPLOYMENT_SUFFIX }}"
+          az_aca_ai_agent_translate_name="${{ vars.AZ_ACA_AI_AGENT_TRANSLATE_NAME }}-${{ env.DEPLOYMENT_SUFFIX }}"
+          echo "NOW=$(date -u +'%Y%m%d-%H%Mz')" >> $GITHUB_ENV
+          echo "AZ_ACR_HOST=$az_acr_host" >> $GITHUB_ENV
+          echo "AZ_RG_NAME=$az_rg_name" >> $GITHUB_ENV
+          echo "AZ_ACA_BOT_NAME=$az_aca_bot_name" >> $GITHUB_ENV
+          echo "AZ_ACA_AI_ASSISTANT_NAME=$az_aca_ai_assistant_name" >> $GITHUB_ENV
+          echo "AZ_ACA_AI_AGENT_CHITCHAT_NAME=$az_aca_ai_agent_chitchat_name" >> $GITHUB_ENV
+          echo "AZ_ACA_AI_AGENT_COMPANYDOCS_NAME=$az_aca_ai_agent_companydocs_name" >> $GITHUB_ENV
+          echo "AZ_ACA_AI_AGENT_ASK_NAME=$az_aca_ai_agent_ask_name" >> $GITHUB_ENV
+          echo "AZ_ACA_AI_AGENT_SUMMARIZE_NAME=$az_aca_ai_agent_summarize_name" >> $GITHUB_ENV
+          echo "AZ_ACA_AI_AGENT_TRANSLATE_NAME=$az_aca_ai_agent_translate_name" >> $GITHUB_ENV
+          echo "Azure Resource Group name is: $az_rg_name"
+          echo "Azure Container Registry host is: $az_acr_host"
+          echo "Azure Container App name for Bot is: $az_aca_bot_name"
+          echo "Azure Container App name for AI Assistant is: $az_aca_ai_assistant_name"
+          echo "Azure Container App name for AI Agent ChitChat is: $az_aca_ai_agent_chitchat_name"
+          echo "Azure Container App name for AI Agent CompanyDocuments is: $az_aca_ai_agent_companydocs_name"
+          echo "Azure Container App name for AI Agent Ask is: $az_aca_ai_agent_ask_name"
+          echo "Azure Container App name for AI Agent Summarize is: $az_aca_ai_agent_summarize_name"
+          echo "Azure Container App name for AI Agent Translate is: $az_aca_ai_agent_tramslate_name"
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ env.ARM_CLIENT_ID }}
+          tenant-id: ${{ env.ARM_TENANT_ID }}
+          subscription-id: ${{ env.ARM_SUBSCRIPTION_ID }}
+
+      - name: Log in to Azure Container Registry (ACR)
+        uses: azure/docker-login@v2
+        with:
+          login-server: ${{ env.AZ_ACR_HOST }}
+          username: ${{ secrets.AZURE_CLIENT_ID }}
+          password: ${{ secrets.AZURE_CLIENT_SECRET }}
+
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Using .NET from 'global.json'
+        uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      - name: Get Version
+        id: GetVersion
+        shell: pwsh
+        run: |
+          $xml = [Xml] (Get-Content "${{ github.workspace }}/Directory.Build.props")
+          $prefix = [System.Linq.Enumerable]::FirstOrDefault($xml.Project.PropertyGroup.VersionPrefix, [Func[object,bool]]{ param($x) $x -ne $null })
+          $suffix = [System.Linq.Enumerable]::FirstOrDefault($xml.Project.PropertyGroup.VersionSuffix, [Func[object,bool]]{ param($x) $x -ne $null })
+          $build = "${{ github.run_number }}"
+          $release_version = ($prefix, $suffix, $build) |  ? { $_ } | Join-String -Separator "-"
+          echo "RELEASE_VERSION=$release_version" >> $env:GITHUB_OUTPUT
+          echo "Release version will be $release_version"
+
+      # In the nexts `Build & Publish Image` steps, We create a temporary file and store its name in `TEMP_FILE`. This file will temporarily hold the
+      # output of the `dotnet publish` command. The `tee` command is used to split the output of `dotnet publish` so that it is both displayed in the
+      # console (for debugging and monitoring) and written to the temporary file. This allows us to see the output in real-time while also capturing it
+      # for further processing. We then use the `grep` command to extract the name of the created image from the temporary file's content. The extracted
+      # image name is stored in the IMAGE_NAME variable, making it available for subsequent steps. Finally, we remove the temporary file to clean up.
+
+      - name: Build & Publish Image - Bot Backend
+        id: BuildPublishImageBot
+        run: |
+          TEMP_FILE=$(mktemp)
+          dotnet publish ./src/Seed.AI.Services.Bot -c ${{ env.BUILD_CONFIGURATION }} -p:ContainerImageTags='"${{ steps.GetVersion.outputs.RELEASE_VERSION }};latest"' -p:ContainerRegistry=${{ env.AZ_ACR_HOST }} /t:PublishContainer | tee $TEMP_FILE
+          IMAGE_NAME=$(grep -oP "(?<=Pushed image ')[^:']*" $TEMP_FILE)
+          echo "IMAGE_NAME=$IMAGE_NAME" >> $GITHUB_OUTPUT
+          echo "Image name for Bot Backend is $IMAGE_NAME"
+          rm $TEMP_FILE
+
+      - name: Build & Publish Image - AI Assistant
+        id: BuildPublishImageAssistant
+        run: |
+          TEMP_FILE=$(mktemp)
+          dotnet publish ./src/Seed.AI.Services.Assistant -c ${{ env.BUILD_CONFIGURATION }} -p:ContainerImageTags='"${{ steps.GetVersion.outputs.RELEASE_VERSION }};latest"' -p:ContainerRegistry=${{ env.AZ_ACR_HOST }} /t:PublishContainer | tee $TEMP_FILE
+          IMAGE_NAME=$(grep -oP "(?<=Pushed image ')[^:']*" $TEMP_FILE)
+          echo "IMAGE_NAME=$IMAGE_NAME" >> $GITHUB_OUTPUT
+          echo "Image name for Bot Backend is $IMAGE_NAME"
+          rm $TEMP_FILE
+
+      - name: Build & Publish Image - AI Agent ChitChat
+        id: BuildPublishImageAgentChitchat
+        run: |
+          TEMP_FILE=$(mktemp)
+          dotnet publish ./src/Seed.AI.Services.Agents.Chitchat -c ${{ env.BUILD_CONFIGURATION }} -p:ContainerImageTags='"${{ steps.GetVersion.outputs.RELEASE_VERSION }};latest"' -p:ContainerRegistry=${{ env.AZ_ACR_HOST }} /t:PublishContainer | tee $TEMP_FILE
+          IMAGE_NAME=$(grep -oP "(?<=Pushed image ')[^:']*" $TEMP_FILE)
+          echo "IMAGE_NAME=$IMAGE_NAME" >> $GITHUB_OUTPUT
+          echo "Image name for Bot Backend is $IMAGE_NAME"
+          rm $TEMP_FILE
+
+      - name: Build & Publish Image - AI Agent CompanyDocuments
+        id: BuildPublishImageAgentCompanyDocuments
+        run: |
+          TEMP_FILE=$(mktemp)
+          dotnet publish ./src/Seed.AI.Services.Agents.CompanyDocuments -c ${{ env.BUILD_CONFIGURATION }} -p:ContainerImageTags='"${{ steps.GetVersion.outputs.RELEASE_VERSION }};latest"' -p:ContainerRegistry=${{ env.AZ_ACR_HOST }} /t:PublishContainer | tee $TEMP_FILE
+          IMAGE_NAME=$(grep -oP "(?<=Pushed image ')[^:']*" $TEMP_FILE)
+          echo "IMAGE_NAME=$IMAGE_NAME" >> $GITHUB_OUTPUT
+          echo "Image name for Bot Backend is $IMAGE_NAME"
+          rm $TEMP_FILE
+
+      - name: Build & Publish Image - AI Agent Ask
+        id: BuildPublishImageAgentAsk
+        run: |
+          TEMP_FILE=$(mktemp)
+          dotnet publish ./src/Seed.AI.Services.Agents.Ask -c ${{ env.BUILD_CONFIGURATION }} -p:ContainerImageTags='"${{ steps.GetVersion.outputs.RELEASE_VERSION }};latest"' -p:ContainerRegistry=${{ env.AZ_ACR_HOST }} /t:PublishContainer | tee $TEMP_FILE
+          IMAGE_NAME=$(grep -oP "(?<=Pushed image ')[^:']*" $TEMP_FILE)
+          echo "IMAGE_NAME=$IMAGE_NAME" >> $GITHUB_OUTPUT
+          echo "Image name for Bot Backend is $IMAGE_NAME"
+          rm $TEMP_FILE
+
+      - name: Build & Publish Image - AI Agent Summarize
+        id: BuildPublishImageAgentSummarize
+        run: |
+          TEMP_FILE=$(mktemp)
+          dotnet publish ./src/Seed.AI.Services.Agents.Summarize -c ${{ env.BUILD_CONFIGURATION }} -p:ContainerImageTags='"${{ steps.GetVersion.outputs.RELEASE_VERSION }};latest"' -p:ContainerRegistry=${{ env.AZ_ACR_HOST }} /t:PublishContainer | tee $TEMP_FILE
+          IMAGE_NAME=$(grep -oP "(?<=Pushed image ')[^:']*" $TEMP_FILE)
+          echo "IMAGE_NAME=$IMAGE_NAME" >> $GITHUB_OUTPUT
+          echo "Image name for Bot Backend is $IMAGE_NAME"
+          rm $TEMP_FILE
+
+      - name: Build & Publish Image - AI Agent Translate
+        id: BuildPublishImageAgentTranslate
+        run: |
+          TEMP_FILE=$(mktemp)
+          dotnet publish ./src/Seed.AI.Services.Agents.Translate -c ${{ env.BUILD_CONFIGURATION }} -p:ContainerImageTags='"${{ steps.GetVersion.outputs.RELEASE_VERSION }};latest"' -p:ContainerRegistry=${{ env.AZ_ACR_HOST }} /t:PublishContainer | tee $TEMP_FILE
+          IMAGE_NAME=$(grep -oP "(?<=Pushed image ')[^:']*" $TEMP_FILE)
+          echo "IMAGE_NAME=$IMAGE_NAME" >> $GITHUB_OUTPUT
+          echo "Image name for Bot Backend is $IMAGE_NAME"
+          rm $TEMP_FILE
+
+      # In the nexts `Update Container App` steps We use the `az containerapp revision copy` command to create a new revision copying the last revision in the Azure Container App.
+
+      - name: Update Container App - Bot Backend
+        uses: azure/cli@v2
+        with:
+          inlineScript: |
+            az containerapp revision copy -n ${{ env.AZ_ACA_BOT_NAME }} -g ${{ env.AZ_RG_NAME }} -i ${{ env.AZ_ACR_HOST }}/${{ steps.BuildPublishImageBot.outputs.IMAGE_NAME }}:${{ steps.GetVersion.outputs.RELEASE_VERSION }} --revision-suffix build-${{ github.run_number }}-${{ env.NOW }}
+
+      - name: Update Container App - AI Assistant
+        uses: azure/cli@v2
+        with:
+          azcliversion: ${{ vars.AZ_CLI_VERSION }}
+          inlineScript: |
+            az containerapp revision copy -n ${{ env.AZ_ACA_AI_ASSISTANT_NAME }} -g ${{ env.AZ_RG_NAME }} -i ${{ env.AZ_ACR_HOST }}/${{ steps.BuildPublishImageAssistant.outputs.IMAGE_NAME }}:${{ steps.GetVersion.outputs.RELEASE_VERSION }} --revision-suffix build-${{ github.run_number }}-${{ env.NOW }}
+
+      - name: Update Container App - AI Agent ChitChat
+        uses: azure/cli@v2
+        with:
+          azcliversion: ${{ vars.AZ_CLI_VERSION }}
+          inlineScript: |
+            az containerapp revision copy -n ${{ env.AZ_ACA_AI_AGENT_CHITCHAT_NAME }} -g ${{ env.AZ_RG_NAME }} -i ${{ env.AZ_ACR_HOST }}/${{ steps.BuildPublishImageAgentChitchat.outputs.IMAGE_NAME }}:${{ steps.GetVersion.outputs.RELEASE_VERSION }} --revision-suffix build-${{ github.run_number }}-${{ env.NOW }}
+
+      - name: Update Container App - AI Agent CompanyDocuments
+        uses: azure/cli@v2
+        with:
+          azcliversion: ${{ vars.AZ_CLI_VERSION }}
+          inlineScript: |
+            az containerapp revision copy -n ${{ env.AZ_ACA_AI_AGENT_COMPANYDOCS_NAME }} -g ${{ env.AZ_RG_NAME }} -i ${{ env.AZ_ACR_HOST }}/${{ steps.BuildPublishImageAgentCompanyDocuments.outputs.IMAGE_NAME }}:${{ steps.GetVersion.outputs.RELEASE_VERSION }} --revision-suffix build-${{ github.run_number }}-${{ env.NOW }}
+
+      - name: Update Container App - AI Agent Ask
+        uses: azure/cli@v2
+        with:
+          azcliversion: ${{ vars.AZ_CLI_VERSION }}
+          inlineScript: |
+            az containerapp revision copy -n ${{ env.AZ_ACA_AI_AGENT_ASK_NAME }} -g ${{ env.AZ_RG_NAME }} -i ${{ env.AZ_ACR_HOST }}/${{ steps.BuildPublishImageAgentCompanyDocuments.outputs.IMAGE_NAME }}:${{ steps.GetVersion.outputs.RELEASE_VERSION }} --revision-suffix build-${{ github.run_number }}-${{ env.NOW }}
+
+      - name: Update Container App - AI Agent Summarize
+        uses: azure/cli@v2
+        with:
+          azcliversion: ${{ vars.AZ_CLI_VERSION }}
+          inlineScript: |
+            az containerapp revision copy -n ${{ env.AZ_ACA_AI_AGENT_SUMMARIZE_NAME }} -g ${{ env.AZ_RG_NAME }} -i ${{ env.AZ_ACR_HOST }}/${{ steps.BuildPublishImageAgentSummarize.outputs.IMAGE_NAME }}:${{ steps.GetVersion.outputs.RELEASE_VERSION }} --revision-suffix build-${{ github.run_number }}-${{ env.NOW }}
+
+      - name: Update Container App - AI Agent Translate
+        uses: azure/cli@v2
+        with:
+          azcliversion: ${{ vars.AZ_CLI_VERSION }}
+          inlineScript: |
+            az containerapp revision copy -n ${{ env.AZ_ACA_AI_AGENT_TRANSLATE_NAME }} -g ${{ env.AZ_RG_NAME }} -i ${{ env.AZ_ACR_HOST }}/${{ steps.BuildPublishImageAgentTranslate.outputs.IMAGE_NAME }}:${{ steps.GetVersion.outputs.RELEASE_VERSION }} --revision-suffix build-${{ github.run_number }}-${{ env.NOW }}
+
+      # Finnaly, We create a new release on the repository using the `gh release create` command.
+      # This command creates a new release with the specified tag and title, and generates release notes based on the commits since the last release.
+
+      - name: Create Release & Tag
+        if: startsWith(github.ref, 'refs/heads/main') || startsWith(github.ref, 'refs/heads/develop') || github.ref == 'refs/heads/test'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          tag: "${{ env.DEPLOYMENT_SUFFIX }}-${{ steps.GetVersion.outputs.RELEASE_VERSION }}"
+          title: "Release ${{ env.DEPLOYMENT_SUFFIX }}-${{ steps.GetVersion.outputs.RELEASE_VERSION }}"
+        run: |
+          gh release create "$tag" \
+              --repo="$GITHUB_REPOSITORY" \
+              --title="$title" \
+              --generate-notes

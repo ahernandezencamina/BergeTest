@@ -1,0 +1,2 @@
+# We use this .gitignore to prevent the inclusion of generated Dockerfiles in the git repository
+#Dockerfile*

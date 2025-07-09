@@ -1,0 +1,255 @@
+trigger:
+  branches:
+    include:
+      - develop
+  paths:
+    include:
+      - src/**
+      - Directory.Build.props
+      - Directory.Build.targets
+      - Berge.Core.IA.sln
+    exclude:
+      - .github/**
+      - /**/*.md
+      - docs/**
+      - infra/**
+      - postman/**
+
+pr:
+  branches:
+    include:
+      - develop
+  paths:
+    include:
+      - src/**
+      - Directory.Build.props
+      - Directory.Build.targets
+      - Berge.Core.IA.sln
+    exclude:
+      - .github/**
+      - /**/*.md
+      - docs/**
+      - infra/**
+      - postman/**
+
+parameters:
+  - name: suffix
+    displayName: 'Suffix to identify manual deployment (mandatory when not redeploying a branch):'
+    type: string
+    default: ''
+
+variables:
+  - group: 'berge'
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+stages:
+- stage: ValidateInputs
+  displayName: 'Validate Inputs'
+  condition: eq(variables['Build.Reason'], 'Manual')
+  jobs:
+  - job: CheckSuffix
+    displayName: 'Check if suffix is required'
+    steps:
+    - script: |
+        if [[ ! ("$(Build.SourceBranch)" == "refs/heads/main" || "$(Build.SourceBranch)" == "refs/heads/test" || "$(Build.SourceBranch)" == "refs/heads/develop") && -z "${{ parameters.suffix }}" ]]; then
+          echo "Error: The input of a suffix to identify a manual deployment is required when the branch is not 'main', 'test', or 'develop'."
+          exit 1
+        fi
+      displayName: 'Validate suffix input'
+
+- stage: ContinuousIntegration
+  displayName: 'Continuous Integration'
+  dependsOn: ValidateInputs
+  condition: or(ne(variables['Build.Reason'], 'Manual'), succeeded('ValidateInputs'))
+  jobs:
+  - job: CI
+    displayName: 'Build and Test'
+    timeoutInMinutes: 30
+    steps:
+    - script: |
+        if [ "$(Build.SourceBranch)" = "refs/heads/main" ]; then
+          echo "##vso[task.setvariable variable=BUILD_CONFIGURATION]Release"
+        else
+          echo "##vso[task.setvariable variable=BUILD_CONFIGURATION]Debug"
+        fi
+      displayName: 'Set Build Configuration'
+
+    - checkout: self
+      displayName: 'Checkout Code'
+
+    - task: JavaToolInstaller@0
+      displayName: 'Set Java for SonarCloud'
+      inputs:
+        versionSpec: '21'
+        jdkArchitectureOption: 'x64'
+        jdkSourceOption: 'PreInstalled'
+
+    - task: UseDotNet@2
+      displayName: 'Using .NET from global.json'
+      inputs:
+        packageType: 'sdk'
+        useGlobalJson: true
+
+    - script: |
+        for proj in $(find src -name '*.csproj'); do
+          dotnet restore "$proj" --configfile NuGet.config --verbosity Minimal --ignore-failed-sources
+        done
+      displayName: 'Restore NuGet Packages'
+
+    - script: dotnet tool install dotnet-reportgenerator-globaltool --tool-path tools --ignore-failed-sources
+      displayName: 'Install Report Generator Tool'
+
+    - script: dotnet test --nologo --no-restore --collect:"XPlat Code Coverage" --configuration $(BUILD_CONFIGURATION) --settings coverlet.runsettings
+      displayName: 'Execute Unit Tests'
+
+    - script: ./tools/reportgenerator -reports:./**/coverage.cobertura.xml -targetdir:coverage/Cobertura -reporttypes:'MarkdownSummaryGithub;Cobertura'
+      displayName: 'Generate Coverage Report'
+      continueOnError: true
+
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Coverage Report'
+      inputs:
+        PathtoPublish: 'coverage/Cobertura/'
+        ArtifactName: 'code-coverage-report'
+      continueOnError: true
+
+    - script: cat coverage/Cobertura/SummaryGithub.md >> $(Agent.TempDirectory)/summary.md
+      displayName: 'Write Coverage Report to Summary'
+      continueOnError: true
+
+    - script: dotnet build --nologo --no-restore --configuration $(BUILD_CONFIGURATION)
+      displayName: 'Build Solution'
+
+- stage: ContinuousDeployment
+  displayName: 'Continuous Deployment'
+  dependsOn: ContinuousIntegration
+  condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+  jobs:
+  - job: Deploy
+    displayName: 'Deploy to Azure'
+    timeoutInMinutes: 30
+    steps:
+    - script: |
+        # Set BUILD_CONFIGURATION
+        if [ "$(Build.SourceBranch)" = "refs/heads/main" ]; then
+          echo "##vso[task.setvariable variable=BUILD_CONFIGURATION]Release"
+        else
+          echo "##vso[task.setvariable variable=BUILD_CONFIGURATION]Debug"
+        fi
+
+        # Set DEPLOYMENT_SUFFIX
+        if [ "$(Build.Reason)" = "Manual" ] && [ -n "${{ parameters.suffix }}" ]; then
+          echo "##vso[task.setvariable variable=DEPLOYMENT_SUFFIX]${{ parameters.suffix }}"
+        elif [ "$(Build.SourceBranch)" = "refs/heads/main" ]; then
+          echo "##vso[task.setvariable variable=DEPLOYMENT_SUFFIX]pro"
+        elif [ "$(Build.SourceBranch)" = "refs/heads/test" ]; then
+          echo "##vso[task.setvariable variable=DEPLOYMENT_SUFFIX]tst"
+        elif [ "$(Build.SourceBranch)" = "refs/heads/develop" ]; then
+          echo "##vso[task.setvariable variable=DEPLOYMENT_SUFFIX]dev"
+        else
+          echo "##vso[task.setvariable variable=DEPLOYMENT_SUFFIX]dev"
+        fi
+      displayName: 'Set Environment Variables'
+
+    - script: |
+        append_suffix_if_needed() {
+          local base_name="$1"
+          local suffix="$2"
+          if [[ "$base_name" != *"$suffix" ]]; then
+            echo "${base_name}-${suffix}"
+          else
+            echo "$base_name"
+          fi
+        }
+
+        az_rg_name="$(AZ_RG_NAME)"
+        az_acr_host="$(AZ_ACR_NAME)$(DEPLOYMENT_SUFFIX).azurecr.io"
+        az_aca_ai_agent_proccessor_name=$(append_suffix_if_needed "$(AZ_ACA_AI_AGENT_PROCCESSOR_NAME)" "$(DEPLOYMENT_SUFFIX)")
+        az_aca_ai_agent_response_name=$(append_suffix_if_needed "$(AZ_ACA_AI_AGENT_RESPONSE_NAME)" "$(DEPLOYMENT_SUFFIX)")
+        
+        now_timestamp=$(date -u +%Y%m%d)
+        echo "Generated timestamp: '$now_timestamp'"
+        revision_suffix="build-${BUILD_BUILDID}-${now_timestamp}"
+        echo "Generated revision suffix: '$revision_suffix'"
+        
+        echo "##vso[task.setvariable variable=NOW]$now_timestamp"
+        echo "##vso[task.setvariable variable=REVISION_SUFFIX]$revision_suffix"
+        echo "##vso[task.setvariable variable=AZ_ACR_HOST]$az_acr_host"
+        echo "##vso[task.setvariable variable=AZ_RG_NAME]$az_rg_name"
+        echo "##vso[task.setvariable variable=AZ_ACA_AI_AGENT_PROCCESSOR_NAME]$az_aca_ai_agent_proccessor_name"
+        echo "##vso[task.setvariable variable=AZ_ACA_AI_AGENT_RESPONSE_NAME]$az_aca_ai_agent_response_name"
+        echo "Azure Resource Group name is: $az_rg_name"
+        echo "Azure Container Registry host is: $az_acr_host"
+        echo "Azure Container App name for AI Agent Proccessor is: $az_aca_ai_agent_proccessor_name"
+        echo "Azure Container App name for AI Agent Response is: $az_aca_ai_agent_response_name"
+        echo "NOW timestamp: $now_timestamp"
+        echo "Revision suffix will be: $revision_suffix"
+      displayName: 'Set Additional Environment Variables'
+
+    - task: AzureCLI@2
+      displayName: 'Azure Login'
+      inputs:
+        azureSubscription: '$(AZURE_SERVICE_CONNECTION_NAME)'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          az acr login --name $(AZ_ACR_HOST)
+
+    - checkout: self
+      displayName: 'Checkout Code'
+
+    - task: UseDotNet@2
+      displayName: 'Using .NET from global.json'
+      inputs:
+        packageType: 'sdk'
+        useGlobalJson: true
+
+    - task: PowerShell@2
+      displayName: 'Get Version'
+      name: GetVersion
+      inputs:
+        targetType: 'inline'
+        script: |
+          $xml = [Xml] (Get-Content "$(Build.SourcesDirectory)/Directory.Build.props")
+          $prefix = [System.Linq.Enumerable]::FirstOrDefault($xml.Project.PropertyGroup.VersionPrefix, [Func[object,bool]]{ param($x) $x -ne $null })
+          $suffix = [System.Linq.Enumerable]::FirstOrDefault($xml.Project.PropertyGroup.VersionSuffix, [Func[object,bool]]{ param($x) $x -ne $null })
+          $build = "$(Build.BuildId)"
+          $release_version = ($prefix, $suffix, $build) |  ? { $_ } | Join-String -Separator "-"
+          Write-Host "##vso[task.setvariable variable=RELEASE_VERSION;isOutput=true]$release_version"
+          Write-Host "Release version will be $release_version"
+
+    - script: |
+        output=$(dotnet publish ./src/Seed.Core.IA.DocumentProccessor -c $(BUILD_CONFIGURATION) -p:ContainerImageTags='"$(GetVersion.RELEASE_VERSION);latest"' -p:ContainerRegistry=$(AZ_ACR_HOST) /t:PublishContainer)
+        IMAGE_NAME=$(echo "$output" | grep -oP "(?<=Pushed image ')[^:']*")
+        echo "##vso[task.setvariable variable=IMAGE_NAME_PROCESSOR;isOutput=true]$IMAGE_NAME"
+        echo "Image name for AI Agent Processor is $IMAGE_NAME"
+      displayName: 'Build & Publish Image - AI Agent Processor'
+      name: BuildPublishImageAgentProcessor
+
+    - script: |
+        output=$(dotnet publish ./src/Seed.Core.IA.ResponseProcess -c $(BUILD_CONFIGURATION) -p:ContainerImageTags='"$(GetVersion.RELEASE_VERSION);latest"' -p:ContainerRegistry=$(AZ_ACR_HOST) /t:PublishContainer)
+        IMAGE_NAME=$(echo "$output" | grep -oP "(?<=Pushed image ')[^:']*")
+        echo "##vso[task.setvariable variable=IMAGE_NAME_RESPONSE;isOutput=true]$IMAGE_NAME"
+        echo "Image name for AI Agent Response is $IMAGE_NAME"
+      displayName: 'Build & Publish Image - AI Agent Response'
+      name: BuildPublishImageAgentResponse
+
+    - task: AzureCLI@2
+      displayName: 'Update Container App - AI Agent Processor'
+      inputs:
+        azureSubscription: '$(AZURE_SERVICE_CONNECTION_NAME)'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          az containerapp revision copy -n $(AZ_ACA_AI_AGENT_PROCCESSOR_NAME) -g $(AZ_RG_NAME) -i $(AZ_ACR_HOST)/$(BuildPublishImageAgentProcessor.IMAGE_NAME_PROCESSOR):$(GetVersion.RELEASE_VERSION) --revision-suffix $(REVISION_SUFFIX)
+
+    - task: AzureCLI@2
+      displayName: 'Update Container App - AI Agent Response'
+      inputs:
+        azureSubscription: '$(AZURE_SERVICE_CONNECTION_NAME)'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          az containerapp revision copy -n $(AZ_ACA_AI_AGENT_RESPONSE_NAME) -g $(AZ_RG_NAME) -i $(AZ_ACR_HOST)/$(BuildPublishImageAgentResponse.IMAGE_NAME_RESPONSE):$(GetVersion.RELEASE_VERSION) --revision-suffix $(REVISION_SUFFIX)

@@ -1,0 +1,47 @@
+name: "IaC - 000 - Backend"
+
+# This workdlow creates the Azure resources needed to store the Terraform (remote) state backend.
+# This workflow should be executed once, since the backend is common to any deployment. Therefore,
+# it makes no sense to configure a continuous integration and deploymenyt strategy for this workflow.
+on:
+  workflow_dispatch:
+
+# More info:
+# https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/controlling-permissions-for-github_token
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  # These environment variables are used by the Terraform Azure provider to setup OIDD authenticate.
+  ARM_CLIENT_ID: "${{ secrets.AZURE_CLIENT_ID }}"
+  ARM_SUBSCRIPTION_ID: "${{ secrets.AZURE_SUBSCRIPTION_ID }}"
+  ARM_TENANT_ID: "${{ secrets.AZURE_TENANT_ID }}"
+
+jobs:
+  deploy-backends:
+    name: "Deploy Terraform Backend"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ env.ARM_CLIENT_ID }}
+          tenant-id: ${{ env.ARM_TENANT_ID }}
+          subscription-id: ${{ env.ARM_SUBSCRIPTION_ID }}
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ vars.TF_VERSION }}
+
+      - name: Terraform Init
+        run: terraform init -upgrade
+        working-directory: ${{ vars.TF_WORKING_DIR_BACKEND }}
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve -var="subscription_id=${{ secrets.AZURE_SUBSCRIPTION_ID }}" -var="location=${{ vars.TF_BACKEND_LOCATION }}" -var="resource_group_name=${{ vars.TF_BACKEND_RESOURCE_GROUP_NAME }}" -var="storage_account_name=${{ vars.TF_BACKEND_STORAGE_ACCOUNT_NAME }}" -var="container_name=${{ vars.TF_BACKEND_CONTAINER_NAME }}"
+        working-directory: ${{ vars.TF_WORKING_DIR_BACKEND }}

@@ -1,0 +1,80 @@
+# CodeQL is the code analysis engine developed by GitHub to automate security checks.
+# The results are shown as code scanning alerts in GitHub. For more details, visit:
+# https://docs.github.com/en/code-security/code-scanning/automatically-scanning-your-code-for-vulnerabilities-and-errors/about-code-scanning-with-codeql
+
+name: "CodeQL"
+
+on:
+  pull_request:
+    branches: ["main", "test", "develop"]
+    paths:
+      - "src/**/*"
+      - Factorial.AI.sln
+      - Directory.Build.props
+      - Directory.Build.targets
+  schedule:
+    # Run every Saturday at 9:30 PM (UTC)
+    - cron: "30 21 * * 6"
+  workflow_dispatch:
+
+jobs:
+  analyze:
+    name: Analyze
+    # Using Windows as the runner for CodeQL analysis because certain project types in the solution, such as `.esproj`, are not supported by the `dotnet` CLI on Linux.
+    # Additionally, it is ideal to use the Autobuild feature of CodeQL rather than running the build manually.
+    runs-on: windows-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # CodeQL supports [ 'cpp', 'csharp', 'go', 'java', 'javascript', 'python', 'ruby' ]
+        # Use only 'java' to analyze code written in Java, Kotlin or both
+        # Use only 'javascript' to analyze code written in JavaScript, TypeScript or both
+        # Learn more about CodeQL language support at https://aka.ms/codeql-docs/language-support
+        language: ["csharp", "javascript"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: "true"
+
+      # Initializes the CodeQL tools for scanning.
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          # If you wish to specify custom queries, you can do so here or in a config file.
+          # By default, queries listed here will override any specified in a config file.
+          # Prefix the list here with "+" to use these queries and those in the config file.
+
+          # Details on CodeQL's query packs refer to : https://docs.github.com/en/code-security/code-scanning/automatically-scanning-your-code-for-vulnerabilities-and-errors/configuring-code-scanning#using-queries-in-ql-packs
+          # queries: security-extended,security-and-quality
+
+      - name: Using .NET from 'global.json'
+        uses: actions/setup-dotnet@v4
+        if: matrix.language == 'csharp'
+        with:
+          global-json-file: global.json
+
+      - name: Install .NET Aspire
+        if: matrix.language == 'csharp'
+        run: |
+          echo "Installing .NET Aspire..."
+          dotnet workload install aspire
+          echo "Update .NET workloads versions from rollback.json file..."
+          dotnet workload update --from-rollback-file ./rollback.json
+
+      # Autobuild attempts to build any compiled languages  (C/C++, C#, Go, or Java).
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{matrix.language}}"
+        continue-on-error: true

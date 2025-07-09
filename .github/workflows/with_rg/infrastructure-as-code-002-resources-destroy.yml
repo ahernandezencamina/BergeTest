@@ -1,0 +1,59 @@
+name: "IaC - 002 - Destroy Resources"
+
+# This workdlow destroys the Azure resources created by the Terraform scripts. Each deployment is identified
+# by a suffix, which is used to identify the Terraform state (file) to be destroyed. Destruction is a
+# dangerous operation, so it is only allowed to be executed manually. Also, it does not makes sense to be
+# executed in a continuous integration and deploymenyt strategy.
+on:
+  workflow_dispatch:
+    inputs:
+      suffix:
+        description: "Suffix to identify the deployment to destroy:"
+        required: true
+        type: string
+
+# More info:
+# https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/controlling-permissions-for-github_token
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  # These environment variables are used by the Terraform Azure provider to setup OIDD authenticate.
+  ARM_CLIENT_ID: "${{ secrets.AZURE_CLIENT_ID }}"
+  ARM_SUBSCRIPTION_ID: "${{ secrets.AZURE_SUBSCRIPTION_ID }}"
+  ARM_TENANT_ID: "${{ secrets.AZURE_TENANT_ID }}"
+  ARM_CLIENT_SECRET: "${{ secrets.AZURE_CLIENT_SECRET }}"
+
+  # These environment variables are used by this workflow to determine the proper deployment configuration.
+  ENVIRONMENT: ${{ github.ref == 'refs/heads/main' && 'Production' || github.ref == 'refs/heads/test' && 'Staging' || github.ref == 'refs/heads/develop' && 'Development' || 'Development' }}
+  ENVIRONMENT_SUFFIX: ${{ github.ref == 'refs/heads/main' && 'pro' || github.ref == 'refs/heads/test' && 'tst' || github.ref == 'refs/heads/develop' && 'dev' || 'dev' }}
+
+jobs:
+  destroy-resources:
+    name: "Destroy Resources"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ env.ARM_CLIENT_ID }}
+          tenant-id: ${{ env.ARM_TENANT_ID }}
+          subscription-id: ${{ env.ARM_SUBSCRIPTION_ID }}
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ vars.TF_VERSION }}
+
+      - name: Terraform Init
+        run: terraform init -upgrade -backend-config="resource_group_name=${{ vars.TF_BACKEND_RESOURCE_GROUP_NAME }}" -backend-config="storage_account_name=${{ vars.TF_BACKEND_STORAGE_ACCOUNT_NAME }}" -backend-config="container_name=${{ vars.TF_BACKEND_CONTAINER_NAME }}" -backend-config="key=${{ inputs.suffix }}.terraform.tfstate"
+        working-directory: ${{ vars.TF_WORKING_DIR_RESOURCES }}
+
+      - name: Terraform Destroy
+        run: terraform destroy -auto-approve -var="subscription_id=${{ secrets.AZURE_SUBSCRIPTION_ID }}" -var="use_random_suffix=false" -var="suffix=${{ inputs.suffix }}" -var="environment=${{ env.ENVIRONMENT }}" -var="resource_group_name=${{ vars.AZ_RG_NAME }}" -var="acr_name=${{ vars.AZ_ACR_NAME }}" -var="aca_bot_name=${{ vars.AZ_ACA_BOT_NAME }}" -var="aca_ai_assistant_name=${{ vars.AZ_ACA_AI_ASSISTANT_NAME }}" -var="aca_ai_agent_chitchat_name=${{ vars.AZ_ACA_AI_AGENT_CHITCHAT_NAME }}" -var="aca_ai_agent_ask_name=${{ vars.AZ_ACA_AI_AGENT_ASK_NAME }}" -var="aca_ai_agent_summarize_name=${{ vars.AZ_ACA_AI_AGENT_SUMMARIZE_NAME }}" -var="aca_ai_agent_translate_name=${{ vars.AZ_ACA_AI_AGENT_TRANSLATE_NAME }}"
+        working-directory: ${{ vars.TF_WORKING_DIR_RESOURCES }}

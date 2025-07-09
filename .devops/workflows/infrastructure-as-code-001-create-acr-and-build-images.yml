@@ -1,0 +1,123 @@
+﻿name: IaC-001-Create-ACR-And-Build-Images
+
+trigger: none
+pr: none
+
+parameters:
+  - name: environment
+    type: string
+    default: Development
+    values:
+      - Development
+      - Production
+  - name: customSuffix
+    type: string
+    default: 'default'
+    displayName: 'Custom resource suffix (leave as default to use environment-based suffix)'
+
+variables:
+  - name: environment
+    value: ${{ parameters.environment }}
+  
+  - name: environmentSuffix
+    ${{ if ne(parameters.customSuffix, 'default') }}:
+      value: ${{ parameters.customSuffix }}
+    ${{ else }}:
+      ${{ if eq(parameters.environment, 'Production') }}:
+        value: 'pro'
+      ${{ else }}:
+        value: 'dev'
+  
+  - group: Berge
+
+stages:
+  - stage: Terraform
+    displayName: '🛠 Terraform Infra (Targeted - ACR)'
+    dependsOn: []
+    jobs:
+      - job: terraform
+        displayName: 'Init and Apply (Targeted - ACR)'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - task: TerraformInstaller@1
+            displayName: '⚙️ Setup Terraform $(TF_VERSION)'
+            inputs:
+              terraformVersion: '$(TF_VERSION)'
+        
+          - task: TerraformCLI@1
+            displayName: '🔄 Terraform Init'
+            inputs:
+              command: 'init'
+              workingDirectory: '$(TF_WORKING_DIR_RESOURCES)'
+              backendType: 'azurerm'
+              backendServiceArm: '$(AZURE_SERVICE_CONNECTION_NAME)'
+              ensureBackend: false
+              commandOptions: >
+                -upgrade
+                -reconfigure
+              backendAzureRmResourceGroupName: '$(TF_BACKEND_RESOURCE_GROUP_NAME)'
+              backendAzureRmStorageAccountName: '$(TF_BACKEND_STORAGE_ACCOUNT_NAME)'
+              backendAzureRmContainerName: '$(TF_BACKEND_CONTAINER_NAME)'
+              backendAzureRmKey: '$(environmentSuffix).terraform.tfstate'
+
+          - task: Bash@3
+            displayName: '📄 Create Terraform Variables File'
+            inputs:
+              targetType: 'inline'
+              workingDirectory: '$(TF_WORKING_DIR_RESOURCES)'
+              script: |
+                cat > terraform.tfvars <<EOF
+                subscription_id = "$(AZURE_SUBSCRIPTION_ID)"
+                use_random_suffix = false
+                suffix = "$(environmentSuffix)"
+                environment = "$(environment)"
+                resource_group_name = "$(AZ_RG_NAME)"
+                acr_name = "$(AZ_ACR_NAME)"               
+                app_insights_name = "$(AZ_APP_INSIGHTS_NAME)"
+                ace_name = "$(AZ_ACE_NAME)"
+                appcs_name = "$(AZ_APPCS_NAME)"
+                cosmos_name = "$(AZ_COSMOS_NAME)"
+                kv_name = "$(AZ_KV_NAME)"
+                log_analytics_workspace_name = "$(AZ_LOG_ANALYTICS_WORKSPACE_NAME)"
+                managed_identity_name = "$(AZ_MANAGE_IDENTITY_NAME)"               
+                storage_account_name = "$(AZ_STORAGE_ACCOUNT_NAME)"    
+                aca_ai_agent_proccessor_name = "$(AZ_ACA_AI_AGENT_PROCCESSOR_NAME)"
+                cosmos_location = "$(AZ_COSMOS_LOCATION)"                
+                conf__blob_container_name = "$(AZ_BLOB_CONTAINER_NAME)"
+                EOF
+                
+                echo "Created terraform.tfvars with the following content:"
+                cat terraform.tfvars
+
+          - task: TerraformCLI@1
+            displayName: '🚀 Terraform Apply (Targeted - ACR)'
+            inputs:
+              command: 'apply'
+              workingDirectory: '$(TF_WORKING_DIR_RESOURCES)'
+              environmentServiceName: '$(AZURE_SERVICE_CONNECTION_NAME)'
+              commandOptions: '-target=module.acr -auto-approve'
+
+  - stage: BuildAndPush
+    displayName: '🐳 Docker Build & Push'
+    dependsOn: Terraform
+    jobs:
+      - job: buildpush
+        displayName: 'Build & Push Images'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: 'Build & Push ACA Docker Images'
+            inputs:
+              azureSubscription: '$(AZURE_SERVICE_CONNECTION_NAME)'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                echo "Building and pushing ACA Proccessor Agent image..."
+                az acr build -t berge-ai-services-agents-proccessor:latest \
+                  -r "$(AZ_ACR_NAME)$(environmentSuffix)" \
+                  -f terraform/resources/modules/aca/init-app/Dockerfile-berge-ai-services-agents-proccessor \
+                  terraform/resources/modules/aca/init-app/
